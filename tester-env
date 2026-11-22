@@ -1,0 +1,342 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# hedgedoc - Tester Environment CLI
+# Usage: ./tester-env <command> [--run-id <id>] [--port <port>]
+# Commands: deploy, seed, verify, reset, stop, logs, status, url, help
+#
+# Deterministic seed data lives in tester-env-seed.js + tester-env-seed/notes/:
+# 8 notes (markdown, tables, code, checklists) with every permission value,
+# 3 users, 2 notes with two revisions and pinned history for each user.
+# See tester-env-seed.json.
+#
+# Source build: Dockerfile.tester-env (node:24-alpine build stage -> production
+# dependency stage -> unprivileged runtime) from this checkout. Single container:
+# sqlite in /data, filesystem uploads in /hedgedoc/public/uploads.
+#
+# Baseline: tag 1.12.0 (b9335040716278d029b5872e3825b92821d9cb70).
+# Deterministic credentials and deployment details are recorded in
+# status/apps/hedgedoc.toml.
+
+RUN_ID="default"
+PORT="13371"
+ADMIN_EMAIL="admin@tester-env.local"
+ADMIN_PASSWORD="HedgeDocAdmin2026!"
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+COMPOSE_FILE="${SCRIPT_DIR}/docker-compose.tester-env.yml"
+SEED_SCRIPT="${SCRIPT_DIR}/tester-env-seed.js"
+SEED_FIXTURES="${SCRIPT_DIR}/tester-env-seed"
+
+refresh_names() {
+    local suffix=""
+    if [[ "${RUN_ID}" != "default" ]]; then
+        suffix="-${RUN_ID}"
+    fi
+
+    CONTAINER_NAME="tester-env-hedgedoc${suffix}"
+    # IMAGE_TAG set by scripts/rl-env to a content-addressed tag so identical
+    # (baseline, patch-set) combos share an image. Manual invocations get :dev.
+    IMAGE_NAME="${IMAGE_TAG:-tester-env-hedgedoc:dev}"
+    COMPOSE_PROJECT="${COMPOSE_PROJECT_NAME:-tester-env-hedgedoc${suffix}}"
+}
+
+# CMD_DOMAIN + CMD_PORT are what HedgeDoc turns into config.serverURL, which is
+# also the socket.io CORS origin. It must equal the browser-visible origin
+# (scripts/rl-env exports TESTER_ENV_BROWSER_ORIGIN) or the editor cannot save.
+resolve_origin() {
+    local origin="${BASE_URL:-${TESTER_ENV_BROWSER_ORIGIN:-http://127.0.0.1:${PORT}}}"
+    local hostport="${origin#*://}"
+    hostport="${hostport%%/*}"
+    CMD_DOMAIN="${hostport%%:*}"
+    case "${hostport}" in
+        *:*) PORT="${hostport##*:}" ;;
+    esac
+    BROWSER_URL="http://${CMD_DOMAIN}:${PORT}"
+    HOST_URL="http://127.0.0.1:${PORT}"
+}
+
+compose() {
+    docker compose \
+        -p "${COMPOSE_PROJECT}" \
+        -f "${COMPOSE_FILE}" \
+        --project-directory "${SCRIPT_DIR}" \
+        "$@"
+}
+
+compose_env() {
+    COMPOSE_PROJECT_NAME="${COMPOSE_PROJECT}" \
+    CONTAINER_NAME="${CONTAINER_NAME}" \
+    IMAGE_TAG="${IMAGE_NAME}" \
+    PORT="${PORT}" \
+    CMD_DOMAIN="${CMD_DOMAIN}" \
+    compose "$@"
+}
+
+wait_for_health() {
+    local attempt
+    for attempt in $(seq 1 180); do
+        if curl -sf "${HOST_URL}/_health" 2>/dev/null | grep -q '"ready":true'; then
+            echo "==> App healthy after ${attempt}s"
+            return 0
+        fi
+        sleep 1
+    done
+
+    echo "Error: app did not become healthy at ${HOST_URL}/_health" >&2
+    compose_env logs --tail 100 >&2 || true
+    exit 1
+}
+
+require_running() {
+    if ! compose_env ps --status running --format '{{.Name}}' 2>/dev/null | grep -qx "${CONTAINER_NAME}"; then
+        echo "Error: container ${CONTAINER_NAME} is not running. Run './tester-env deploy' first." >&2
+        exit 1
+    fi
+}
+
+ensure_admin_user() {
+    local out
+    if out="$(compose_env exec -T app node bin/manage_users --add "${ADMIN_EMAIL}" --pass "${ADMIN_PASSWORD}" 2>&1)"; then
+        echo "==> Created user ${ADMIN_EMAIL}"
+    elif grep -q "already exists" <<<"${out}"; then
+        echo "==> User ${ADMIN_EMAIL} already exists"
+    else
+        echo "${out}" >&2
+        echo "Error: could not create ${ADMIN_EMAIL}." >&2
+        exit 1
+    fi
+}
+
+cmd_deploy() {
+    echo "==> Building image from source: ${IMAGE_NAME}"
+    echo "    Cold build: yarn install --immutable + webpack prod bundle + production focus"
+    echo "    (~2 GB RAM for webpack; the dependency layer is cached across source edits)"
+
+    echo "==> Starting container ${CONTAINER_NAME} on port ${PORT}..."
+    compose_env up -d --build
+
+    wait_for_health
+    ensure_admin_user
+
+    echo "==> Deployment complete."
+    echo "    URL:      ${HOST_URL}/"
+    echo "    Browser:  ${BROWSER_URL}/"
+    echo "    Login:    ${ADMIN_EMAIL} / ${ADMIN_PASSWORD}"
+}
+
+cmd_seed() {
+    require_running
+    echo "==> Seeding deterministic note data..."
+    run_seed_script seed
+    echo "==> Seed complete."
+}
+
+# The seed script and its markdown fixtures are copied into the container so the
+# committed files stay the single source of truth (no rebuild needed). The script
+# sits next to its notes directory, so it finds the fixtures by __dirname.
+run_seed_script() {
+    compose_env cp "${SEED_FIXTURES}" app:/tmp/tester-env-seed >/dev/null
+    compose_env cp "${SEED_SCRIPT}" app:/tmp/tester-env-seed/tester-env-seed.js >/dev/null
+    compose_env exec -T app node /tmp/tester-env-seed/tester-env-seed.js "$@"
+}
+
+cmd_verify() {
+    require_running
+    echo "==> Verifying HedgeDoc deployment..."
+
+    if ! curl -sf "${HOST_URL}/_health" | grep -q '"ready":true'; then
+        echo "Error: /_health is not ready." >&2
+        exit 1
+    fi
+    echo "    health:   /_health ready"
+
+    local jar
+    jar="$(mktemp)"
+    # ${jar:-} because the EXIT trap also runs when the local is out of scope.
+    trap 'rm -f "${jar:-}"' EXIT
+
+    local code
+    code="$(curl -s -o /dev/null -w '%{http_code}' -c "${jar}" -b "${jar}" \
+        -X POST "${HOST_URL}/login" \
+        --data-urlencode "email=${ADMIN_EMAIL}" \
+        --data-urlencode "password=${ADMIN_PASSWORD}")"
+    if [[ "${code}" != "302" ]]; then
+        echo "Error: login POST /login returned ${code}, expected 302." >&2
+        exit 1
+    fi
+
+    local home
+    home="$(curl -sf -b "${jar}" "${HOST_URL}/")"
+    if ! grep -q '/logout' <<<"${home}"; then
+        echo "Error: after login, GET / does not render the signed-in navigation (/logout)." >&2
+        exit 1
+    fi
+    echo "    auth:     login OK (${ADMIN_EMAIL}), signed-in index renders"
+
+    code="$(curl -s -o /dev/null -w '%{http_code}' -b "${jar}" "${HOST_URL}/history")"
+    if [[ "${code}" != "200" ]]; then
+        echo "Error: GET /history returned ${code}, expected 200." >&2
+        exit 1
+    fi
+    echo "    history:  /history returns 200"
+
+    run_seed_script verify
+
+    echo "==> Verify passed."
+}
+
+cmd_reset() {
+    echo "==> Resetting environment (drop container, sqlite and uploads volumes)..."
+    compose_env down -v --remove-orphans || true
+    echo "==> Reset complete. Run './tester-env deploy' for an empty database."
+}
+
+cmd_stop() {
+    echo "==> Stopping container (volumes preserved)..."
+    compose_env down
+}
+
+cmd_logs() {
+    compose_env logs -f --tail 100 "$@"
+}
+
+cmd_status() {
+    if compose_env ps --status running --format '{{.Name}}' 2>/dev/null | grep -qx "${CONTAINER_NAME}"; then
+        # The container's CMD_DOMAIN is authoritative when the caller did not
+        # pass TESTER_ENV_BROWSER_ORIGIN (it may have been deployed with one).
+        local domain
+        domain="$(docker inspect -f '{{range .Config.Env}}{{println .}}{{end}}' "${CONTAINER_NAME}" 2>/dev/null \
+            | sed -n 's/^CMD_DOMAIN=//p')"
+        echo "Status: RUNNING"
+        echo "URL: ${HOST_URL}/"
+        echo "Browser URL: http://${domain:-${CMD_DOMAIN}}:${PORT}/"
+        echo "Container: ${CONTAINER_NAME}"
+        echo "Image: ${IMAGE_NAME}"
+        echo "Login: ${ADMIN_EMAIL} / ${ADMIN_PASSWORD}"
+    else
+        echo "Status: NOT RUNNING"
+    fi
+}
+
+cmd_url() {
+    echo "${HOST_URL}/"
+    echo "browser: ${BROWSER_URL}/"
+}
+
+cmd_help() {
+    cat <<EOF
+hedgedoc - Tester Environment CLI
+
+Usage: ./tester-env <command> [--run-id <id>] [--port <port>]
+
+Commands:
+  deploy    Build the image from source, start the container, wait for /_health, create the admin user
+  seed      Create the deterministic note data (8 notes, 3 users, revisions, history)
+  verify    Assert /_health, logins, /history and the whole seeded state (pages,
+            permission matrix, rendered markdown, revisions, history entries)
+  reset     Remove the container and both volumes (down -v) for an empty database
+  stop      Stop the container and keep the volumes
+  logs      Follow container logs
+  status    Show whether the app is running and on which port
+  url       Print the host URL and the browser-visible URL
+  help      Show this help
+
+Options:
+  --run-id <id>   Isolate container and compose project/volumes for parallel runs. Default: default
+  --port <port>   Host port (also the in-container listen port). Default: 13371
+                  Ignored when BASE_URL / TESTER_ENV_BROWSER_ORIGIN supplies a port.
+
+Typical workflow:
+  ./tester-env deploy    # Build, start, create admin user
+  ./tester-env seed      # Deterministic users, notes, revisions and history
+  ./tester-env verify    # Health + logins + every seeded page/value
+  ./tester-env reset     # Clean slate (down -v)
+
+Deployment details:
+  - Baseline: 1.12.0 (b9335040716278d029b5872e3825b92821d9cb70); the tag ships
+    no Dockerfile, so Dockerfile.tester-env adapts the official hedgedoc/container
+    alpine recipe (node:24.22.3-alpine, vendored yarn 4.13.0,
+    yarn install --immutable, yarn build, yarn workspaces focus --production).
+  - Single container: CMD_DB_URL=sqlite:///data/db.hedgedoc.sqlite; migrations run
+    automatically at startup. Uploads use CMD_IMAGE_UPLOAD_TYPE=filesystem.
+  - The app listens on the published port so config.serverURL (CMD_DOMAIN +
+    CMD_PORT + CMD_URL_ADDPORT) matches the browser origin used by socket.io.
+  - State is two named volumes: /data (sqlite + session store) and
+    /hedgedoc/public/uploads. Reset is 'docker compose down -v'.
+  - Anonymous notes and free-URL aliases are enabled; email registration is
+    disabled, so accounts come from bin/manage_users (admin) and the seed
+    (dana, priya).
+
+Credentials:
+  ${ADMIN_EMAIL} / ${ADMIN_PASSWORD}          (owner: onboarding, style guide, hiring plan)
+  dana@tester-env.local / HedgeDocDana2026!   (owner: runbook, postmortem, weekly sync, 1:1)
+  priya@tester-env.local / HedgeDocPriya2026! (no owned notes; history only)
+  The seed creates dana and priya; admin comes from deploy.
+
+Environment:
+  IMAGE_TAG                   Content-addressed image tag exported by scripts/rl-env
+  TESTER_ENV_BROWSER_ORIGIN   Browser-visible origin (sets CMD_DOMAIN/port)
+  BASE_URL                    Explicit app URL override (wins over the origin)
+  PORT                        Host port (same as --port)
+
+Caveats:
+  - webpack prod build is the slow step (first build several minutes); the
+    install layer is cached, so source-only mutations re-run only yarn build.
+  - Note content saves travel over socket.io; assert on the synced state, not on
+    the keystroke.
+  - Login requests from one IP are limited to CMD_RATE_LIMIT_USER (10 per 5
+    minutes). seed and verify each log in three users, so a third login-heavy
+    command on the same running stack within five minutes can return 429;
+    reset+deploy restarts the limiter.
+EOF
+}
+
+main() {
+    local cmd="${1:-help}"
+    shift || true
+
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --run-id)
+                RUN_ID="${2:?--run-id requires a value}"
+                shift 2
+                ;;
+            --port)
+                PORT="${2:?--port requires a value}"
+                shift 2
+                ;;
+            --help|-h)
+                cmd_help
+                exit 0
+                ;;
+            *)
+                echo "Unknown option: $1" >&2
+                cmd_help
+                exit 1
+                ;;
+        esac
+    done
+
+    resolve_origin
+    refresh_names
+
+    case "${cmd}" in
+        deploy|up) cmd_deploy ;;
+        verify) cmd_verify ;;
+        seed) cmd_seed ;;
+        reset) cmd_reset ;;
+        stop|down) cmd_stop ;;
+        logs) cmd_logs ;;
+        status) cmd_status ;;
+        url) cmd_url ;;
+        help|--help|-h) cmd_help ;;
+        *)
+            echo "Unknown command: ${cmd}" >&2
+            cmd_help
+            exit 1
+            ;;
+    esac
+}
+
+main "$@"

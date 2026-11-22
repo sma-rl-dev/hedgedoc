@@ -1,0 +1,67 @@
+# tester-env compose file for HedgeDoc 1.12.0 (single container: Node 24,
+# sqlite database + filesystem image uploads, no external services).
+#
+# The tester-env CLI is the supported entry point; it supplies IMAGE_TAG,
+# CONTAINER_NAME, COMPOSE_PROJECT_NAME, PORT and CMD_DOMAIN. Direct
+# `docker compose up --build` also works with the defaults below (port 13371,
+# domain 127.0.0.1).
+#
+# Reset gate: all state lives in two named volumes, so `docker compose down -v`
+# restores an empty database. The schema is migrated automatically at startup.
+#   <project>_hedgedoc-data     -> /data/db.hedgedoc.sqlite (+ session store)
+#   <project>_hedgedoc-uploads  -> /hedgedoc/public/uploads
+#
+# CMD_DOMAIN + CMD_PORT build config.serverURL, which is also the socket.io CORS
+# origin, so it must match the browser-visible origin exactly: the app listens
+# on the published port and the CLI derives CMD_DOMAIN from
+# TESTER_ENV_BROWSER_ORIGIN (fallback 127.0.0.1:PORT).
+
+name: ${COMPOSE_PROJECT_NAME:-tester-env-hedgedoc}
+
+services:
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile.tester-env
+    image: ${IMAGE_TAG:-tester-env-hedgedoc:dev}
+    container_name: ${CONTAINER_NAME:-tester-env-hedgedoc}
+    environment:
+      # sqlite:///<absolute path> is the documented 1.x form (three slashes =
+      # absolute path). Verified working on this deployment.
+      CMD_DB_URL: "sqlite:///data/db.hedgedoc.sqlite"
+      CMD_SESSION_SECRET: "tester-env-hedgedoc-session-secret-0123456789abcdef0123456789abcdef"
+      CMD_HOST: "0.0.0.0"
+      CMD_PORT: "${PORT:-13371}"
+      CMD_DOMAIN: "${CMD_DOMAIN:-127.0.0.1}"
+      CMD_URL_ADDPORT: "true"
+      CMD_ALLOW_ANONYMOUS: "true"
+      CMD_ALLOW_ANONYMOUS_EDITS: "true"
+      CMD_ALLOW_FREEURL: "true"
+      CMD_ALLOW_EMAIL_REGISTER: "false"
+      CMD_IMAGE_UPLOAD_TYPE: "filesystem"
+      CMD_ENABLE_UPLOADS: "all"
+      CMD_LOGLEVEL: "info"
+      TZ: "UTC"
+    ports:
+      - "${PORT:-13371}:${PORT:-13371}"
+    volumes:
+      - hedgedoc-data:/data
+      - hedgedoc-uploads:/hedgedoc/public/uploads
+    healthcheck:
+      # /_health returns {"ready": bool}; ready flips false during shutdown.
+      test:
+        [
+          "CMD",
+          "node",
+          "-e",
+          "fetch('http://127.0.0.1:' + process.env.CMD_PORT + '/_health').then(r => r.json()).then(d => process.exit(d.ready ? 0 : 1)).catch(() => process.exit(1))",
+        ]
+      interval: 5s
+      timeout: 5s
+      start_period: 20s
+      retries: 24
+    restart: "no"
+
+volumes:
+  hedgedoc-data:
+  hedgedoc-uploads:

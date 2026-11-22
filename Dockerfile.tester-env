@@ -1,0 +1,87 @@
+# tester-env source build for HedgeDoc 1.x (fork-owned).
+#
+# Upstream tag 1.12.0 ships no Dockerfile; the official image (hedgedoc/container
+# alpine/Dockerfile) clones the repo, runs `yarn install --immutable` + `yarn
+# build` and prunes to production deps with `yarn workspaces focus --production`.
+# This file keeps that proven recipe but COPYs the editable checkout instead of
+# cloning, and splits it into three stages so a source mutation only re-runs
+# webpack (the install layer is keyed on package.json/yarn.lock/.yarnrc.yml).
+#
+# Notes:
+#   - sqlite3 5.1.7 is a native module with no musl prebuild, so both the install
+#     and the production-focus stage need python3/build-base (node-gyp).
+#   - webpack 4 patches crypto md4 -> sha256 itself (webpack.common.js), so the
+#     prod frontend build works on Node 24 / OpenSSL 3.
+#   - yarn 4.13.0 is vendored at .yarn/releases and invoked directly; Node 24
+#     corepack presence is not relied on.
+
+ARG NODE_IMAGE=node:24.22.3-alpine
+
+# ---------------------------------------------------------------------------
+# Stage 1: full dependency tree + prod frontend bundle
+# ---------------------------------------------------------------------------
+FROM ${NODE_IMAGE} AS builder
+
+ENV PUPPETEER_SKIP_DOWNLOAD=true \
+    YARN_CACHE_FOLDER=/tmp/.yarn \
+    NODE_ENV=development
+
+WORKDIR /src
+
+RUN apk add --no-cache git jq python3 build-base
+
+# Dependency layer: manifests only, so editing lib/ or public/ reuses it.
+COPY package.json yarn.lock .yarnrc.yml ./
+COPY .yarn ./.yarn
+RUN --mount=type=cache,id=hedgedoc-yarn,target=/tmp/.yarn,sharing=locked \
+    node .yarn/releases/yarn-4.13.0.cjs install --immutable
+
+COPY . .
+
+# webpack --config webpack.prod.js -> public/build (+ public/views/htmlexport)
+RUN node .yarn/releases/yarn-4.13.0.cjs build
+
+# ---------------------------------------------------------------------------
+# Stage 2: prune to production dependencies (compiles sqlite3 for musl)
+# ---------------------------------------------------------------------------
+FROM ${NODE_IMAGE} AS modules
+
+ENV NODE_ENV=production \
+    YARN_CACHE_FOLDER=/tmp/.yarn
+
+WORKDIR /src
+
+RUN apk add --no-cache git python3 build-base
+
+COPY --from=builder /src /src
+RUN --mount=type=cache,id=hedgedoc-yarn,target=/tmp/.yarn,sharing=locked \
+    node .yarn/releases/yarn-4.13.0.cjs workspaces focus --production
+
+# ---------------------------------------------------------------------------
+# Stage 3: runtime (unprivileged uid/gid 10000, no entrypoint needed)
+# ---------------------------------------------------------------------------
+FROM ${NODE_IMAGE} AS app
+
+WORKDIR /hedgedoc
+
+ENV NODE_ENV=production
+
+ARG UID=10000
+ARG GID=10000
+
+RUN addgroup -g ${GID} hedgedoc \
+    && adduser -u ${UID} -h /hedgedoc -D -S hedgedoc -G hedgedoc
+
+COPY --chown=${UID}:${GID} --from=modules /src /hedgedoc
+
+# /data (sqlite+session store) and public/uploads are named volumes. Docker
+# copies this directory metadata into a fresh named volume, so the unprivileged
+# user can write without a root entrypoint/chown step.
+RUN mkdir -p /data /hedgedoc/public/uploads \
+    && chown -R ${UID}:${GID} /data /hedgedoc/public/uploads
+
+EXPOSE 3000
+
+USER ${UID}:${GID}
+
+CMD ["node", "app.js"]
